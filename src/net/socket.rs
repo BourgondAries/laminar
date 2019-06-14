@@ -100,6 +100,38 @@ impl Socket {
         if let Err(e) = self.handle_idle_clients(time) {
             error!("Encountered an error when sending TimeoutEvent: {:?}", e);
         }
+
+        // Finally re-send all non-acknowledged reliable packets that have been waiting too long
+        if self.should_send_packet() {
+            for (address, connection) in self.connections.iter_mut() {
+                for waiting_packet in connection.gather_dropped_packets() {
+                    let processed_packet = connection.process_outgoing(
+                        &waiting_packet.payload,
+                        // Because a delivery guarantee is only sent with reliable packets
+                        DeliveryGuarantee::Reliable,
+                        // This is stored with the dropped packet because they could be mixed
+                        waiting_packet.ordering_guarantee,
+                        time,
+                    );
+
+                    let processed_packet = match processed_packet {
+                        Ok(pkt) => pkt,
+                        Err(_) => continue,
+                    };
+
+                    match processed_packet {
+                        Outgoing::Packet(outgoing) => {
+                            let _ = self.socket.send_to(&outgoing.contents(), &address);
+                        }
+                        Outgoing::Fragments(packets) => {
+                            for outgoing in packets {
+                                let _ = self.socket.send_to(&outgoing.contents(), &address);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Iterate through all of the idle connections based on `idle_connection_timeout` config and
@@ -123,21 +155,6 @@ impl Socket {
             self.connections
                 .get_or_insert_connection(packet.addr(), &self.config, time);
 
-        let dropped = connection.gather_dropped_packets();
-        let mut processed_packets: Vec<Outgoing> = dropped
-            .iter()
-            .flat_map(|waiting_packet| {
-                connection.process_outgoing(
-                    &waiting_packet.payload,
-                    // Because a delivery guarantee is only sent with reliable packets
-                    DeliveryGuarantee::Reliable,
-                    // This is stored with the dropped packet because they could be mixed
-                    waiting_packet.ordering_guarantee,
-                    time,
-                )
-            })
-            .collect();
-
         let processed_packet = connection.process_outgoing(
             packet.payload(),
             packet.delivery_guarantee(),
@@ -145,20 +162,16 @@ impl Socket {
             time,
         )?;
 
-        processed_packets.push(processed_packet);
-
         let mut bytes_sent = 0;
 
-        for processed_packet in processed_packets {
-            if self.should_send_packet() {
-                match processed_packet {
-                    Outgoing::Packet(outgoing) => {
+        if self.should_send_packet() {
+            match processed_packet {
+                Outgoing::Packet(outgoing) => {
+                    bytes_sent += self.send_packet(&packet.addr(), &outgoing.contents())?;
+                }
+                Outgoing::Fragments(packets) => {
+                    for outgoing in packets {
                         bytes_sent += self.send_packet(&packet.addr(), &outgoing.contents())?;
-                    }
-                    Outgoing::Fragments(packets) => {
-                        for outgoing in packets {
-                            bytes_sent += self.send_packet(&packet.addr(), &outgoing.contents())?;
-                        }
                     }
                 }
             }
@@ -459,6 +472,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sent_events, vec![0, 1, 35]);
+        assert_eq!(sent_events, vec![35, 0, 1]);
     }
 }

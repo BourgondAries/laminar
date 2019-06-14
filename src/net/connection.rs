@@ -20,6 +20,12 @@ impl ActiveConnections {
         }
     }
 
+    pub(crate) fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&SocketAddr, &mut VirtualConnection)> {
+        self.connections.iter_mut()
+    }
+
     /// Try to get a `VirtualConnection` by address. If the connection does not exist, it will be
     /// inserted and returned.
     pub fn get_or_insert_connection(
